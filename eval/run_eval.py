@@ -19,7 +19,9 @@ import argparse
 import hashlib
 import concurrent.futures
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -51,20 +53,34 @@ with the fenced JSON block the skill's output format requires, using
 """
 
 
+def find_claude() -> str | None:
+    """Full path to the `claude` CLI, or None. $CLAUDE_BIN overrides PATH.
+    Resolving through shutil.which lets Windows find claude.cmd / .exe,
+    which subprocess will not do from a bare "claude"."""
+    override = os.environ.get("CLAUDE_BIN")
+    if override:
+        return override if Path(override).is_file() else None
+    return shutil.which("claude")
+
+
 def grade_one(item_id: str, bundle_path: Path, skill: str, rubric: str,
-              timeout: int) -> dict:
+              timeout: int, claude_bin: str) -> dict:
     prompt = PROMPT_TEMPLATE.format(
         skill=skill, rubric=rubric, item_id=item_id,
         bundle=bundle_path.read_text(encoding="utf-8"))
-    cmd = ["claude", "-p", "--model", MODEL]
+    cmd = [claude_bin, "-p", "--model", MODEL]
     last_err = "no attempt"
     for _ in range(2):                       # one retry on bad output
         try:
             proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                                  text=True, timeout=timeout)
+                                  encoding="utf-8", errors="replace",
+                                  timeout=timeout)
         except subprocess.TimeoutExpired:
             last_err = f"timed out after {timeout}s"
             continue
+        except OSError as e:
+            last_err = f"could not run {claude_bin}: {e}"
+            break
         if proc.returncode != 0:
             last_err = f"claude exited {proc.returncode}: " \
                        f"{proc.stderr.strip()[:200]}"
@@ -183,6 +199,10 @@ def main() -> int:
                     help="also write full results as JSON to this path")
     a = ap.parse_args()
 
+    for s in (sys.stdout, sys.stderr):      # Windows consoles default to cp1252
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
+
     run_log = None
     if a.save_run:
         run_log = _Tee(sys.stdout)
@@ -233,13 +253,20 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    claude_bin = find_claude()
+    if claude_bin is None:
+        print("error: the `claude` CLI was not found. Install Claude Code "
+              "so `claude` runs from a terminal, or set CLAUDE_BIN to the "
+              "full path of claude.exe.", file=sys.stderr)
+        return 2
+
     print(f"grading {len(items)} bundle(s) with {rubric_p.name}, "
           f"model {MODEL}, {a.workers} worker(s)...", flush=True)
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(a.workers) as pool:
         futs = {pool.submit(grade_one, it["id"],
                             issues_dir / f"{it['id']}.md",
-                            skill, rubric, a.timeout): it["id"]
+                            skill, rubric, a.timeout, claude_bin): it["id"]
                 for it in items}
         for fut in concurrent.futures.as_completed(futs):
             r = fut.result()
